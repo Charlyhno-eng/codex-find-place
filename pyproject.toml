@@ -1,0 +1,34 @@
+[project]
+name = "codex-find-place"
+version = "0.1.0"
+description = "Enquête photographique locale avec Codex"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.34,<1",
+    "python-multipart>=0.0.20",
+    "pillow>=11,<13",
+    "exifread>=3,<4",
+    "astral>=3.2,<4",
+    "tzdata>=2025.1",
+    "pydantic>=2.10,<3",
+    "httpx>=0.28,<1",
+    "playwright>=1.50,<2",
+]
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "httpx>=0.28,<1"]
+
+[project.scripts]
+codex-find-place = "osint_picture.app:main"
+osint-picture = "osint_picture.app:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["osint_picture"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
