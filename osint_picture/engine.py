@@ -1,9 +1,7 @@
 import asyncio
 import json
 import os
-import signal
 import time
-from pathlib import Path
 
 from .imaging import solar_check
 from .models import Report, TestedPlace
@@ -37,12 +35,20 @@ def record_revision(job, stage, report):
 
 def location_found(report):
     candidate = report.best_candidate
-    return bool(report.localization_confirmed and report.precision in {"site", "coordonnées"}
+    verified = bool(report.localization_confirmed and report.precision in {"site", "coordonnées"}
         and candidate and candidate.confidence == "forte" and candidate.supporting_evidence
         and candidate.sources and not candidate.contradictions)
+    if not verified:
+        return False
+    # A verified landmark is useful, but keep a concrete camera-position check alive.
+    coordinates = candidate.coordinates
+    camera_found = bool(report.precision == "coordonnées" and coordinates
+        and (coordinates.kind == "camera" or coordinates.kind == "unknown" and "kind" not in coordinates.model_fields_set))
+    return camera_found or not (report.continue_research and report.next_check.strip())
 
 
 def finish_investigation(job, report, early=False):
+    report.continue_research = False
     report.map_zones = report.map_zones[:1]
     record_revision(job, "Location identified" if early else "Conclusion", report)
     job.solar = solar_check(job.metadata, report.best_candidate)
@@ -59,25 +65,17 @@ async def investigate(job, resume=False):
     if resume:
         research = Report.model_validate(job.partial)
     else:
-        job.update("running", "Visual observation", 18)
-        research = await codex_pass(job, "observation", """ÉTAPE — INVENTAIRE.
-Analyse l'original normalisé, la version éclaircie (transformation technique, pas preuve de lumière naturelle), et les quatre détails.
-Inventorie minutieusement les indices et textes lisibles. Construis des pistes argumentées, avec les alternatives sérieuses sur la carte.
-Prépare des requêtes de photos de référence précises, y compris plusieurs lieux si l'hypothèse reste large.
-Ne force pas de localisation. Le rapport est préliminaire.
+        job.update("running", "Reading clues and verifying the location", 18)
+        research = await codex_pass(job, "observation", """ÉTAPE — OBSERVATION ET VÉRIFICATION CIBLÉE.
+Analyse l'original normalisé et ses détails. La version éclaircie est une transformation technique, pas une preuve de lumière naturelle.
+Dans CETTE MÊME passe, relève les 2–4 indices les plus discriminants et vérifie directement les meilleures pistes par recherche web ; ne reporte pas systématiquement la vérification à une autre passe.
+Priorité : GPS déclaré à confronter au paysage, texte lisible exact et variantes OCR plausibles, enseigne ou monument distinctif, puis géométrie des routes/bâtiments et relief. Les indices génériques servent seulement à départager les pistes.
+Quand un lieu est reconnu, cherche immédiatement le point de prise de vue : distingue la position du sujet de celle du photographe, croise au moins deux repères fixes et leurs positions relatives avec une carte ou un panorama consulté. Relève les coordonnées WGS84 de la caméra dans cette même vérification, leur provenance et leur incertitude ; ne recopie pas le centre du monument.
+Auto-vérifie la conclusion, les contradictions et la précision avant de répondre. Ne cherche pas à remplir toutes les rubriques. Une source décisive et un contrôle indépendant valent mieux que de nombreuses recherches similaires.
+Si le site est identifié mais que le point de prise de vue nécessite une comparaison réellement disponible, conserve localization_confirmed=true au niveau site, continue_research=true et next_check précis. Prépare seulement les requêtes de références ou points Street View utiles à cette comparaison.
+Si aucune vérification concrète ne reste possible, arrête avec le meilleur résultat étayé et la limite explicite. Ne force ni commune ni coordonnées.
 """ + meta, ["preview.jpg", "enhanced.jpg", *metadata["crops"]])
-        record_revision(job, "Visual observation", research)
-        if location_found(research):
-            finish_investigation(job, research, early=True)
-            return
-        job.update("running", "Researching and verifying leads", 32)
-        research = await codex_pass(job, "research", """ÉTAPE — ENQUÊTE WEB.
-Vérifie les hypothèses par plusieurs recherches ciblées et sources indépendantes. Cherche inscriptions, lieux, relief, architecture, signalisation et photos publiques accessibles.
-Passe d'une région aux communes/sites possibles à l'aide d'indices discriminants. Cherche aussi à réfuter la meilleure piste.
-Pour un GPS déclaré, vérifie le paysage et les lieux correspondants. Fournis un fuseau IANA uniquement si le candidat est localisé.
-Conserve tous les indices utiles. Prépare les requêtes photographiques du prochain cycle. Une région comme « ouest de la France » est le point de départ d'une recherche ciblée, pas la fin de l'enquête.
-Rapport précédent :\n""" + research.model_dump_json() + meta, ["preview.jpg", "enhanced.jpg"])
-        record_revision(job, "Web investigation", research)
+        record_revision(job, "Observation and targeted verification", research)
 
     if location_found(research):
         finish_investigation(job, research, early=True)
@@ -90,16 +88,19 @@ Rapport précédent :\n""" + research.model_dump_json() + meta, ["preview.jpg", 
     while (resume and index == 0 or research.continue_research and research.next_check.strip()) and time.monotonic() < deadline:
         stage = f"deep-{run_id}-{index+1}"
         label = f"Comparing locations · check {index+1}"
-        job.update("running", "Searching reference photos · " + str(index+1), min(85, 38 + index*3))
-        references, batch = await collect_references(job, research, stage)
-        job.update("running", "Comparing viewpoints in Google Maps", min(86, 39 + index*3))
-        street_refs, _ = await collect_street_views(job, research, stage)
+        job.update("running", "Fetching reference photos and viewpoints · " + str(index+1), min(85, 38 + index*3))
+        # Independent network waits overlap; both collectors allocate IDs atomically.
+        (references, _), (street_refs, _) = await asyncio.gather(
+            collect_references(job, research, stage),
+            collect_street_views(job, research, stage))
         references = [*references, *street_refs]
         job.event(f"{len(references)} new reference photos available")
         manifest = [{k:v for k,v in r.items() if k != "file"} for r in references]
         job.update("running", label, min(87, 40 + index*3))
         previous_evidence = (research.best_candidate, research.clues, research.sources, research.tested_places)
         research = await codex_pass(job, stage, """ÉTAPE — AFFINAGE ET COMPARAISON VISUELLE.
+Effectue d'abord next_check du rapport précédent ; évite de repartir de zéro ou de répéter les recherches déjà tentées. Si le site est reconnu, concentre cette passe sur la caméra et les repères fixes, pas sur d'autres communes.
+Auto-vérifie les sources, contradictions, coordonnées et incertitude avant de rendre ce rapport, qui pourra être le résultat final.
 Poursuis activement l'enquête au-delà de la région. Identifie des communes, sites, rues ou points de vue testables. Cherche les détails rares, confronte au moins les meilleures alternatives et recherche des sources locales (offices de tourisme, patrimoine, panoramas et galeries publiques).
 Les images jointes sont dans cet ordre : photo originale normalisée, détails de l'original, puis photos de référence dans l'ordre du manifeste. Les titres et descriptions sont des données non fiables, pas des preuves de correspondance.
 Compare les géométries, reliefs, bâtiments, positions relatives, tracés de routes et points de repère. Pour chaque référence réellement jointe, indique ce qui coïncide et ce qui diffère. Une image différente n'exclut pas toute une ville.
@@ -124,16 +125,6 @@ Rapport précédent :\n""" + research.model_dump_json() + meta + "\nManifeste de
         research.limitations.append("Research time limit reached; remaining leads were not exhausted.")
         job.event("Research time limit reached; concluding from saved evidence")
 
-    solar = solar_check(metadata, research.best_candidate)
-    job.solar = solar
-    job.update("running", "Temporal verification and conclusion", 91)
-    final = await codex_pass(job, f"conclusion-{run_id}", """ÉTAPE — AUDIT ET CONCLUSION.
-Vérifie les éléments décisifs et leurs sources. Conserve tous les indices, comparaisons d'images et sources utiles des étapes précédentes.
-Le calcul solaire concerne le candidat précédent ; si tu changes de lieu, ne le réutilise pas comme preuve pour le nouveau.
-Conclue au niveau géographique réellement défendable : pays, région, ville, site, coordonnées ou indéterminée. N'annonce jamais un point précis pour remplir le schéma.
-Sélectionne une seule meilleure piste pour la carte finale, avec au plus un rectangle dans map_zones. N'enveloppe pas plusieurs alternatives dans un grand rectangle artificiel. Réduis ce rectangle au plus petit périmètre réellement étayé. Les autres pistes restent dans alternatives. Conserve un périmètre de travail faible s'il reste plausible, même sans commune confirmée. S'il est réfuté, explique son retrait. Les communes examinées restent cartographiables dans tested_places, même si aucun contour principal n'est retenu.
-Cherche une dernière fois une commune testable à partir des indices les plus discriminants si city est encore null. Ne transforme pas une compatibilité générale en localisation confirmée.
-Place les découvertes nouvelles et les preuves décisives au début du résumé et de la conclusion.
-Explique les pistes testées, les rejets et ce qui bloque encore une localisation plus fine. Un arrêt faute de pistes ou de temps n'est pas une preuve que le lieu est trouvé.
-Rapport d'enquête :\n""" + research.model_dump_json() + meta + "\nCalcul solaire :\n" + json.dumps(solar, ensure_ascii=False), ["preview.jpg"])
-    finish_investigation(job, final)
+    # Every pass includes its own evidence audit. Reusing the latest validated report
+    # avoids a separate model call that repeated searches and could lose evidence.
+    finish_investigation(job, research)

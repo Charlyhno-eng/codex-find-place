@@ -20,9 +20,11 @@ class Clue(Strict):
 
 
 class Coordinates(Strict):
-    latitude: float = Field(ge=-90, le=90)
-    longitude: float = Field(ge=-180, le=180)
-    accuracy_meters: float | None = Field(ge=0)
+    kind: Literal["camera", "landmark", "area", "unknown"] = Field(default="unknown",
+        description="What this point represents: camera position, photographed landmark, area centre, or unknown. Never equate landmark coordinates with camera coordinates.")
+    latitude: float = Field(ge=-90, le=90, allow_inf_nan=False)
+    longitude: float = Field(ge=-180, le=180, allow_inf_nan=False)
+    accuracy_meters: float | None = Field(ge=0, allow_inf_nan=False)
     altitude_meters: float | None = Field(default=None, description="Altitude above mean sea level in meters; null unless verified.")
     altitude_basis: str | None = None
     basis: str

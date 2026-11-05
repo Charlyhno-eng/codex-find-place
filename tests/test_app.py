@@ -84,8 +84,8 @@ def test_research_cycles_and_solar_recomputed(monkeypatch, tmp_path):
     job = Job('a'*32, tmp_path)
     job.metadata = {'crops':[]}
     asyncio.run(investigate(job))
-    assert stages == ['observation','research','conclusion-2']
-    assert len(job.revisions) == 3
+    assert stages == ['observation']  # observation, web verification and audit share one pass
+    assert len(job.revisions) == 2
     assert len(job.reference_batches) == 0
     assert 'research_rounds' not in job.settings
     assert job.status == 'completed'
@@ -136,7 +136,8 @@ def test_api_upload_persistence_export_and_untrusted_content(client, monkeypatch
     monkeypatch.setattr(module,'run_job',fake)
     with client:
         assert client.get('/').status_code == 200
-        assert client.get('/static/app.js').status_code == 200
+        assert client.get('/static/dist/index.html').status_code == 200
+        assert client.get('/investigations/' + 'b' * 32).status_code == 200
         assert client.post('/api/jobs',files={'file':('fake.jpg',b'not image','image/jpeg')}).status_code == 400
         assert client.post('/api/jobs',files={'file':('empty.jpg',b'','image/jpeg')}).status_code == 400
         assert client.post('/api/jobs',headers={'Origin':'https://evil.example'},files={'file':('a.jpg',image_bytes())}).status_code == 403
@@ -240,7 +241,7 @@ def test_resuming_old_report_retains_history_and_compares_references(monkeypatch
     monkeypatch.setattr('osint_picture.engine.collect_references',collect)
     monkeypatch.setattr('osint_picture.engine.codex_pass',fake)
     asyncio.run(investigate(job,resume=True))
-    assert len(calls) == 2 and 'observation' not in [c[0] for c in calls]
+    assert len(calls) == 1 and 'observation' not in [c[0] for c in calls]
     assert 'ref-0001.jpg' in calls[0][1]
     assert len(job.revisions) == 2
     assert job.report['map_zones'][0]['label'] == 'Ouest de la France'
@@ -358,7 +359,7 @@ def test_tested_place_coordinates_must_be_paired():
                     basis='test', sources=[], street_view_heading=None)
 
 
-@pytest.mark.parametrize('mode', ['capture', 'blocked', 'no_coverage', 'consent_refused'])
+@pytest.mark.parametrize('mode', ['capture', 'blocked', 'no_coverage', 'consent_refused', 'concurrent'])
 def test_street_view_browser_capture_and_blockage(monkeypatch, tmp_path, mode):
     blocked = mode in {'blocked', 'no_coverage'}
     from osint_picture.models import TestedPlace
@@ -382,7 +383,12 @@ def test_street_view_browser_capture_and_blockage(monkeypatch, tmp_path, mode):
         def get_by_text(self, *args, **kw): return Locator(self, mode == "no_coverage")
         async def wait_for_url(self, *args, **kw): pass
         async def wait_for_timeout(self, *args): pass
-        async def screenshot(self, path, **kw): Path(path).write_bytes(image_bytes())
+        async def screenshot(self, path, **kw):
+            # Another collector completes while Playwright is taking its screenshot.
+            if mode == 'concurrent':
+                (tmp_path / 'ref-0001.jpg').write_bytes(b'commons-photo')
+                job.references.append({'id':'ref-0001', 'file':'ref-0001.jpg', 'image_url':'https://example.com/photo'})
+            Path(path).write_bytes(image_bytes())
     class Browser:
         closed = False
         async def new_context(self, **kw): return self
@@ -407,11 +413,15 @@ def test_street_view_browser_capture_and_blockage(monkeypatch, tmp_path, mode):
         assert (tmp_path / refs[0]['file']).exists()
         assert 'heading=90.0' in refs[0]['image_url']
         assert refs[0]['provider'] == 'Google Maps / Street View'
-        refs, batch = asyncio.run(collect_street_views(job, report, 'cycle2'))
-        assert refs == [] and batch is None
+        if mode == 'concurrent':
+            assert refs[0]['id'] == 'ref-0002'
+            assert (tmp_path / 'ref-0001.jpg').read_bytes() == b'commons-photo'
+            assert len({r['id'] for r in job.references}) == len(job.references)
+    refs, batch = asyncio.run(collect_street_views(job, report, 'cycle2'))
+    assert refs == [] and batch is None
 
 
-@pytest.mark.parametrize('found_at', ['observation', 'research', 'deep'])
+@pytest.mark.parametrize('found_at', ['observation', 'deep'])
 def test_confirmed_location_stops_without_extra_search(monkeypatch, tmp_path, found_at):
     from osint_picture.models import CameraOrientation, Source
     found = blank_report()
@@ -443,7 +453,7 @@ def test_confirmed_location_stops_without_extra_search(monkeypatch, tmp_path, fo
     job.metadata = {'crops': []}
     job.settings = {'model': 'test-model', 'reasoning_effort': 'high', 'research_rounds': 6}
     asyncio.run(investigate(job))
-    assert len(calls) == {'observation': 1, 'research': 2, 'deep': 3}[found_at]
+    assert len(calls) == {'observation': 1, 'deep': 2}[found_at]
     assert len(downloads) == (2 if found_at == 'deep' else 0)
     assert job.status == 'completed'
     assert job.report['camera_orientation']['heading_degrees'] == 90
@@ -505,7 +515,7 @@ def test_autonomous_research_continues_beyond_legacy_rounds(monkeypatch, tmp_pat
     job.metadata = {'crops': []}
     job.settings = {'model':'test-model','reasoning_effort':'high','research_rounds':1}
     asyncio.run(investigate(job))
-    assert len([s for s in calls if s.startswith('deep-')]) == 3
+    assert len([s for s in calls if s.startswith('deep-')]) == 4
     assert job.status == 'completed'
 
 
@@ -525,7 +535,8 @@ def test_autonomous_research_stops_on_stagnation(monkeypatch, tmp_path):
     job.settings = {'model':'test-model','reasoning_effort':'high'}
     asyncio.run(investigate(job))
     assert len([s for s in calls if s.startswith('deep-')]) == 2
-    assert calls[-1].startswith('conclusion-')
+    assert calls[-1].startswith('deep-')
+    assert not any(s.startswith('conclusion-') for s in calls)
 
 
 def test_similarity_cannot_confirm_without_evidence_and_altitude_is_optional():
@@ -541,3 +552,90 @@ def test_similarity_cannot_confirm_without_evidence_and_altitude_is_optional():
     assert Coordinates.model_validate_json(coordinates.model_dump_json()).altitude_meters == 35
     with pytest.raises(ValidationError):
         type(report.best_candidate).model_validate({**report.best_candidate.model_dump(), 'visual_similarity_score':101})
+
+
+def test_confirmed_site_keeps_one_actionable_camera_check(monkeypatch, tmp_path):
+    from osint_picture.models import Source
+    from osint_picture.engine import location_found
+    site = blank_report()
+    site.localization_confirmed = True
+    site.precision = 'site'
+    site.best_candidate = paris()
+    site.best_candidate.confidence = 'forte'
+    site.best_candidate.supporting_evidence = ['Landmark facade verified.']
+    site.best_candidate.sources = [Source(title='Landmark', url='https://example.com', supports='Facade')]
+    site.best_candidate.coordinates.kind = 'landmark'
+    site.continue_research = True
+    site.next_check = 'Align the facade and road junction in the nominated panorama.'
+    assert not location_found(site)
+    camera = site.model_copy(deep=True)
+    camera.precision = 'coordonnées'
+    camera.best_candidate.coordinates.kind = 'camera'
+    camera.best_candidate.coordinates.accuracy_meters = 8
+    assert location_found(camera)
+    unknown = camera.model_copy(deep=True)
+    unknown.best_candidate.coordinates.kind = 'unknown'
+    assert not location_found(unknown)
+    calls = []
+    async def analyze(job, stage, instruction, images):
+        calls.append(stage)
+        return site if stage == 'observation' else camera
+    started = set()
+    async def photos(job, report, stage):
+        started.add('photos')
+        while 'street' not in started:
+            await asyncio.sleep(0)
+        return [], {}
+    async def street(job, report, stage):
+        started.add('street')
+        while 'photos' not in started:
+            await asyncio.sleep(0)
+        return [], {}
+    monkeypatch.setattr('osint_picture.engine.codex_pass', analyze)
+    monkeypatch.setattr('osint_picture.engine.collect_references', photos)
+    monkeypatch.setattr('osint_picture.engine.collect_street_views', street)
+    job = Job('c'*32, tmp_path)
+    job.metadata = {'crops': []}
+    job.settings = {'model':'test-model', 'reasoning_effort':'high'}
+    asyncio.run(asyncio.wait_for(investigate(job), 2))
+    assert len(calls) == 2
+    assert job.report['best_candidate']['coordinates']['kind'] == 'camera'
+    assert job.report['best_candidate']['coordinates']['accuracy_meters'] == 8
+    assert not job.report['continue_research']
+
+
+def test_coordinate_roles_and_nonfinite_values():
+    from pydantic import ValidationError
+    assert Coordinates(latitude=0, longitude=0, accuracy_meters=None, basis='Unknown').kind == 'unknown'
+    for field in ('latitude', 'longitude', 'accuracy_meters'):
+        for value in (float('nan'), float('inf')):
+            payload = dict(latitude=0, longitude=0, accuracy_meters=None, basis='test')
+            payload[field] = value
+            with pytest.raises(ValidationError):
+                Coordinates(**payload)
+
+
+def test_reference_searches_overlap_without_duplicate_images(monkeypatch, tmp_path):
+    import httpx
+    import osint_picture.references as refs
+    started = set()
+    async def serve(request):
+        if request.url.host == 'commons.wikimedia.org':
+            started.add(request.url.params['gsrsearch'])
+            while len(started) < 2:
+                await asyncio.sleep(0)
+            return httpx.Response(200, json={'query': {'pages': {'1': {'title':'File:Shared.jpg', 'imageinfo':[{
+                'thumburl':'https://upload.wikimedia.org/shared.jpg', 'descriptionurl':'https://commons.wikimedia.org/wiki/File:Shared.jpg'}]}}}})
+        if request.url.host == 'api.openverse.org':
+            return httpx.Response(200, json={'results': []})
+        return httpx.Response(200, content=image_bytes())
+    actual_client = httpx.AsyncClient
+    monkeypatch.setattr(refs.httpx, 'AsyncClient', lambda **kw: actual_client(transport=httpx.MockTransport(serve), **kw))
+    job = Job('f'*32, tmp_path)
+    report = blank_report()
+    report.reference_queries = ['Rare facade', 'Named junction']
+    result, batch = asyncio.run(asyncio.wait_for(refs.collect_references(job, report, 'cycle'), 2))
+    assert len(started) == 2
+    assert len(result) == 1
+    assert len(job.references) == 1
+    assert batch['reference_ids'] == ['ref-0001']

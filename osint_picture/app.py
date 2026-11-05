@@ -3,6 +3,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -15,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from PIL import UnidentifiedImageError, Image
 
 from .engine import investigate, terminate
+from .frontend import prepare_frontend
 from .imaging import inspect_image
 from .settings import Settings, load_settings, save_settings, settings_payload
 
@@ -100,8 +102,9 @@ async def local_only(request: Request, call_next):
 
 
 @app.get("/")
+@app.get("/investigations/{job_id}")
 async def index():
-    return FileResponse(ROOT / "static/index.html")
+    return FileResponse(ROOT / "static/dist/index.html")
 
 
 @app.get("/api/health")
@@ -298,5 +301,9 @@ app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 
 
 def main():
+    try:
+        prepare_frontend(ROOT.parent)
+    except (RuntimeError, OSError, subprocess.CalledProcessError) as exc:
+        raise SystemExit(f"Application startup failed: {exc}") from exc
     print("\n  Codex Find Place → http://127.0.0.1:8000\n")
     uvicorn.run("osint_picture.app:app", host="127.0.0.1", port=8000)

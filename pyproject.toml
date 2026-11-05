@@ -21,7 +21,6 @@ dev = ["pytest>=8,<10", "httpx>=0.28,<1"]
 
 [project.scripts]
 codex-find-place = "osint_picture.app:main"
-osint-picture = "osint_picture.app:main"
 
 [build-system]
 requires = ["hatchling"]

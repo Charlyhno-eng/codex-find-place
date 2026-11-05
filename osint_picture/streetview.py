@@ -17,6 +17,8 @@ def street_url(latitude, longitude, heading=0):
 
 async def collect_street_views(job, report, stage):
     seen = {r.get('image_url') for r in job.references}
+    # Failed/no-coverage targets should not spend the same network timeout every cycle.
+    seen.update(url for batch in job.reference_batches for url in batch.get('target_urls', []))
     places = [p for p in report.tested_places if p.latitude is not None and p.status != 'écarté']
     targets = []
     for place in places:
@@ -29,7 +31,7 @@ async def collect_street_views(job, report, stage):
     if not targets:
         return [], None
     batch = {'stage': stage + '-streetview', 'queries': [p.label for p, _ in targets],
-             'reference_ids': [], 'errors': []}
+             'reference_ids': [], 'errors': [], 'target_urls': [url for _, url in targets]}
     refs = []
     try:
         from playwright.async_api import async_playwright
@@ -59,9 +61,13 @@ async def collect_street_views(job, report, stage):
                         unavailable = page.get_by_text(re.compile(r'Aucune image Street View disponible|No Street View imagery|Street View is not available', re.I))
                         if await unavailable.count():
                             raise ValueError('Google reports no Street View imagery at this point; the fallback view is not evidence for this location')
+                        # Capture first, then allocate and commit without an await. Commons
+                        # downloads can finish while this screenshot is being rendered.
+                        capture = job.directory / 'streetview-pending.jpg'
+                        await page.screenshot(path=str(capture), type='jpeg', quality=85)
                         ref_id = f'ref-{len(job.references)+1:04d}'
                         filename = ref_id + '.jpg'
-                        await page.screenshot(path=str(job.directory / filename), type='jpeg', quality=85)
+                        capture.replace(job.directory / filename)
                         ref = {'id': ref_id, 'file': filename, 'title': 'Street view to verify · ' + place.label,
                                'page_url': page.url, 'image_url': url, 'query': place.label, 'stage': stage,
                                'author': 'Attribution visible dans la capture', 'license': 'Google Maps · consultation',

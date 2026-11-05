@@ -1,4 +1,5 @@
 """Download bounded public reference photos from Wikimedia Commons and Openverse for actual vision comparison."""
+import asyncio
 import html
 import io
 import json
@@ -37,12 +38,17 @@ async def collect_references(job, report, stage):
     batch = {"stage": stage, "queries": queries, "reference_ids": [], "errors": []}
     seen = {r["page_url"] for r in job.references}
     async with httpx.AsyncClient(headers=HEADERS, timeout=httpx.Timeout(20), follow_redirects=False) as client:
-        for query in queries:
+        async def search(query):
+            return await read_limited(client, "https://commons.wikimedia.org/w/api.php", 2*1024*1024,
+                {"action":"query", "format":"json", "generator":"search", "gsrsearch":query,
+                 "gsrnamespace":6, "gsrlimit":3, "prop":"imageinfo", "iiprop":"url|extmetadata", "iiurlwidth":960})
+        # At most four independent searches share a single client and overlap waits.
+        results = await asyncio.gather(*(search(query) for query in queries), return_exceptions=True)
+        for query, raw in zip(queries, results):
             before = len(batch["reference_ids"])
             try:
-                raw = await read_limited(client, "https://commons.wikimedia.org/w/api.php", 2*1024*1024,
-                    {"action":"query", "format":"json", "generator":"search", "gsrsearch":query,
-                     "gsrnamespace":6, "gsrlimit":3, "prop":"imageinfo", "iiprop":"url|extmetadata", "iiurlwidth":960})
+                if isinstance(raw, BaseException):
+                    raise raw
                 data = json.loads(raw)
                 if "error" in data:
                     raise ValueError(plain(data["error"].get("info", "Erreur Wikimedia")))
